@@ -10,6 +10,9 @@ from typing import List, Dict, Tuple, Optional
 from collections import Counter
 import math
 import random
+import time
+import psutil
+import gc
 
 class MultilingualTokenizer:
     """Multilingual tokenizer for Sanskrit, Hindi, and English text."""
@@ -318,22 +321,61 @@ class GeetaTrainer:
     
     def __init__(self, model: GeetaGPT, tokenizer: MultilingualTokenizer, dataset: GeetaDataset,
                  device: str = 'cpu', learning_rate: float = 0.0001):
+        print("🏋️ Initializing GeetaTrainer...")
+        start_time = time.time()
+        
         self.model = model.to(device)
         self.tokenizer = tokenizer
         self.dataset = dataset
         self.device = device
         
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        # Initialize optimizer with different options
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), eps=1e-8)
+        
+        # Initialize criterion
         self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.vocab[tokenizer.pad_token])
         
-        self.train_loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+        # Create data loader with optimized settings
+        self.batch_size = 32  # This will be overridden by the trainer's batch_size
+        self.train_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,  # Set to 0 for debugging, can be increased for performance
+            pin_memory=True if device == 'cuda' else False,
+            drop_last=True
+        )
+        
+        # Initialize training metrics
+        self.epoch_losses = []
+        self.batch_losses = []
+        self.training_start_time = start_time
+        
+        init_time = time.time() - start_time
+        print(f"✅ GeetaTrainer initialized in {init_time:.2f} seconds")
+        print(f"📊 Dataset size: {len(dataset):,} samples")
+        print(f"📊 Batch size: {self.batch_size}")
+        print(f"📊 Number of batches: {len(self.train_loader)}")
     
     def train_epoch(self, epoch: int):
         """Train for one epoch."""
+        print(f"🔥 Starting Epoch {epoch + 1}")
+        epoch_start_time = time.time()
+        
         self.model.train()
         total_loss = 0
+        batch_count = 0
+        
+        # Training metrics
+        epoch_losses = []
+        learning_rates = []
+        
+        print(f"📊 Training with {len(self.train_loader)} batches")
         
         for batch_idx, (inputs, targets) in enumerate(self.train_loader):
+            batch_start_time = time.time()
+            
+            # Move data to device
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             
             # Forward pass
@@ -345,15 +387,80 @@ class GeetaTrainer:
             
             # Backward pass
             loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            # Update weights
             self.optimizer.step()
             
-            total_loss += loss.item()
+            # Track metrics
+            loss_value = loss.item()
+            total_loss += loss_value
+            batch_count += 1
+            epoch_losses.append(loss_value)
             
-            if batch_idx % 100 == 0:
-                print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}')
+            # Get current learning rate
+            current_lr = self.optimizer.param_groups[0]['lr']
+            learning_rates.append(current_lr)
+            
+            batch_time = time.time() - batch_start_time
+            
+            # Print batch progress
+            if batch_idx % 50 == 0:
+                print(f'📊 Epoch {epoch + 1}, Batch {batch_idx}/{len(self.train_loader)}')
+                print(f'   • Loss: {loss_value:.4f}')
+                print(f'   • Batch Time: {batch_time:.3f}s')
+                print(f'   • Learning Rate: {current_lr:.6f}')
+                
+                # Print memory usage
+                if self.device == 'cuda':
+                    allocated = torch.cuda.memory_allocated() / (1024**2)  # MB
+                    cached = torch.cuda.memory_reserved() / (1024**2)  # MB
+                    print(f'   • GPU Memory: {allocated:.1f}MB allocated, {cached:.1f}MB cached')
+            
+            # Early stopping check for extremely high loss
+            if loss_value > 10.0:  # Threshold for potential issues
+                print(f"⚠️  High loss detected: {loss_value:.4f} at batch {batch_idx}")
+                print("   This might indicate training issues. Consider checking data or model.")
         
+        # Calculate epoch statistics
         avg_loss = total_loss / len(self.train_loader)
-        print(f'Epoch {epoch}, Average Loss: {avg_loss:.4f}')
+        epoch_time = time.time() - epoch_start_time
+        
+        # Calculate loss statistics
+        min_loss = min(epoch_losses)
+        max_loss = max(epoch_losses)
+        std_loss = torch.std(torch.tensor(epoch_losses)).item()
+        
+        # Learning rate statistics
+        avg_lr = sum(learning_rates) / len(learning_rates)
+        
+        # Store epoch loss
+        self.epoch_losses.append(avg_loss)
+        self.batch_losses.extend(epoch_losses)
+        
+        # Print epoch summary
+        print(f"🎯 Epoch {epoch + 1} Summary:")
+        print(f"   • Average Loss: {avg_loss:.4f}")
+        print(f"   • Min/Max Loss: {min_loss:.4f} / {max_loss:.4f}")
+        print(f"   • Loss Std Dev: {std_loss:.4f}")
+        print(f"   • Learning Rate: {avg_lr:.6f}")
+        print(f"   • Epoch Time: {epoch_time:.2f}s ({epoch_time/60:.2f} minutes)")
+        print(f"   • Batches/Second: {len(self.train_loader) / epoch_time:.2f}")
+        
+        # Print memory usage at end of epoch
+        if self.device == 'cuda':
+            allocated = torch.cuda.memory_allocated() / (1024**2)  # MB
+            cached = torch.cuda.memory_reserved() / (1024**2)  # MB
+            print(f"   • GPU Memory: {allocated:.1f}MB allocated, {cached:.1f}MB cached")
+        
+        # Check for NaN or infinite loss
+        if torch.isnan(torch.tensor(avg_loss)) or torch.isinf(torch.tensor(avg_loss)):
+            print(f"❌ Invalid loss detected: {avg_loss}")
+            print("   Training stopped due to invalid loss values")
+            return None
+        
         return avg_loss
     
     def forward(self, inputs: torch.Tensor):
@@ -366,21 +473,167 @@ class GeetaTrainer:
     def train(self, num_epochs: int, save_path: str = "geeta_gpt_model.pth"):
         """Train the model."""
         print(f"🚀 Starting training on {self.device}")
+        print(f"📊 Training Parameters:")
+        print(f"   • Total Epochs: {num_epochs}")
+        print(f"   • Save Path: {save_path}")
+        print(f"   • Model Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"   • Trainable Parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
+        
+        training_start_time = time.time()
+        best_loss = float('inf')
+        
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
         
         for epoch in range(num_epochs):
-            loss = self.train_epoch(epoch)
+            epoch_start_time = time.time()
             
-            # Save checkpoint
-            if epoch % 10 == 0:
-                torch.save({
+            try:
+                # Train epoch
+                loss = self.train_epoch(epoch)
+                
+                if loss is None:
+                    print("❌ Training stopped due to invalid loss")
+                    break
+                
+                # Update learning rate scheduler
+                scheduler.step(loss)
+                
+                # Save best model
+                if loss < best_loss:
+                    best_loss = loss
+                    best_model_state = {
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'loss': loss,
+                        'best_loss': best_loss,
+                        'epoch_losses': self.epoch_losses
+                    }
+                    print(f"🏆 New best model with loss: {loss:.4f}")
+                
+                # Save checkpoint
+                if epoch % 10 == 0 or epoch == num_epochs - 1:
+                    checkpoint = {
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'loss': loss,
+                        'best_loss': best_loss,
+                        'epoch_losses': self.epoch_losses,
+                        'batch_losses': self.batch_losses
+                    }
+                    torch.save(checkpoint, save_path)
+                    print(f"💾 Model checkpoint saved at epoch {epoch}")
+                
+                # Print epoch summary
+                epoch_time = time.time() - epoch_start_time
+                total_time = time.time() - training_start_time
+                eta = (total_time / (epoch + 1)) * (num_epochs - epoch - 1)
+                
+                print(f"⏱️  Total Training Time: {total_time:.2f}s ({total_time/60:.2f}m)")
+                print(f"⏱️  Estimated Time Remaining: {eta:.2f}s ({eta/60:.2f}m)")
+                
+                # Print loss trend
+                if len(self.epoch_losses) > 1:
+                    improvement = self.epoch_losses[-2] - self.epoch_losses[-1]
+                    improvement_pct = (improvement / self.epoch_losses[-2]) * 100
+                    print(f"📈 Loss Improvement: {improvement:.4f} ({improvement_pct:.2f}%)")
+                
+                print("-" * 60)
+                
+                # Memory optimization every 5 epochs
+                if epoch % 5 == 0:
+                    self.optimize_memory()
+            
+            except KeyboardInterrupt:
+                print(f"\n⚠️  Training interrupted at epoch {epoch}")
+                print("💾 Saving current state...")
+                interrupted_state = {
                     'epoch': epoch,
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
-                    'loss': loss,
-                }, save_path)
-                print(f"💾 Model saved at epoch {epoch}")
+                    'loss': loss if loss else best_loss,
+                    'best_loss': best_loss,
+                    'epoch_losses': self.epoch_losses,
+                    'batch_losses': self.batch_losses,
+                    'interrupted': True
+                }
+                torch.save(interrupted_state, save_path.replace('.pth', '_interrupted.pth'))
+                print("✅ Model saved with '_interrupted' suffix")
+                break
+            
+            except Exception as e:
+                print(f"❌ Error at epoch {epoch}: {str(e)}")
+                print("💾 Saving error state...")
+                error_state = {
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': loss if loss else best_loss,
+                    'best_loss': best_loss,
+                    'epoch_losses': self.epoch_losses,
+                    'batch_losses': self.batch_losses,
+                    'error': str(e)
+                }
+                torch.save(error_state, save_path.replace('.pth', '_error.pth'))
+                print("✅ Model saved with '_error' suffix")
+                break
         
-        print("✅ Training completed!")
+        # Save final best model
+        if 'best_model_state' in locals():
+            torch.save(best_model_state, save_path.replace('.pth', '_best.pth'))
+            print(f"💾 Best model saved to {save_path.replace('.pth', '_best.pth')}")
+        
+        # Final training statistics
+        total_training_time = time.time() - training_start_time
+        avg_loss = sum(self.epoch_losses) / len(self.epoch_losses) if self.epoch_losses else 0
+        
+        print("=" * 60)
+        print("🎉 Training completed!")
+        print(f"📊 Final Statistics:")
+        print(f"   • Total Training Time: {total_training_time:.2f}s ({total_training_time/60:.2f}m)")
+        print(f"   • Average Loss: {avg_loss:.4f}")
+        print(f"   • Best Loss: {best_loss:.4f}")
+        print(f"   • Total Epochs Completed: {len(self.epoch_losses)}")
+        print(f"   • Batches Trained: {len(self.batch_losses)}")
+        print("=" * 60)
+        
+        # Save training history
+        training_history = {
+            'total_time': total_training_time,
+            'total_epochs': len(self.epoch_losses),
+            'total_batches': len(self.batch_losses),
+            'avg_loss': avg_loss,
+            'best_loss': best_loss,
+            'epoch_losses': self.epoch_losses,
+            'batch_losses': self.batch_losses,
+            'training_end_time': time.time()
+        }
+        
+        return training_history
+    
+    def optimize_memory(self):
+        """Optimize memory usage during training."""
+        print("🗑️  Optimizing memory...")
+        
+        # Clear gradients
+        self.optimizer.zero_grad()
+        
+        # Garbage collection
+        import gc
+        gc.collect()
+        
+        # Clear CUDA cache if using GPU
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+            allocated = torch.cuda.memory_allocated() / (1024**2)  # MB
+            cached = torch.cuda.memory_reserved() / (1024**2)  # MB
+            print(f"   • GPU Memory after cleanup: {allocated:.1f}MB allocated, {cached:.1f}MB cached")
+        
+        print("✅ Memory optimization completed")
     
     def save_model(self, path: str):
         """Save trained model."""
